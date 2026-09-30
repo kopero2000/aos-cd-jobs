@@ -1,5 +1,3 @@
-// activity == true, means that the timeout will only occur if there
-// is no log activity for the specified period.
 timeout(activity: true, time: 120, unit: 'MINUTES') {
     node() {
         timestamps {
@@ -26,7 +24,7 @@ timeout(activity: true, time: 120, unit: 'MINUTES') {
                         commonlib.ocpVersionParam('VERSION', '4plus'),
                         string(
                             name: 'ASSEMBLY',
-                            description: 'Assembly to sync (default: stream)',
+                            description: 'Assembly to use (default: stream)',
                             defaultValue: "stream",
                             trim: true,
                         ),
@@ -44,30 +42,15 @@ timeout(activity: true, time: 120, unit: 'MINUTES') {
                         ),
                         string(
                             name: 'ONLY_STREAM',
-                            description: '(Optional) Only sync images for the specified stream name from streams.yml',
+                            description: '(Optional) Only process the specified stream name from streams.yml',
                             defaultValue: "",
                             trim: true,
                         ),
                         string(
                             name: 'IMAGES',
-                            description: '(Optional) Comma-separated distgit keys to sync (e.g. ci-openshift-base.rhel10). Must have ci_alignment.upstream_image set.',
+                            description: '(Optional) Comma-separated distgit keys to process (e.g. ci-openshift-base.rhel10). Must have ci_alignment.upstream_image set.',
                             defaultValue: "",
                             trim: true,
-                        ),
-                        booleanParam(
-                            name: 'SKIP_WAITS',
-                            description: 'Do not wait for builds to complete',
-                            defaultValue: false,
-                        ),
-                        booleanParam(
-                            name: 'FORCE_RUN',
-                            description: 'Force run even if image list has not changed',
-                            defaultValue: false,
-                        ),
-                        booleanParam(
-                            name: 'UPDATE_IMAGES_ONLY_WHEN_MISSING',
-                            description: 'Only mirror images when missing from destination',
-                            defaultValue: false,
                         ),
                         booleanParam(
                             name: 'DRY_RUN',
@@ -83,10 +66,6 @@ timeout(activity: true, time: 120, unit: 'MINUTES') {
 
         commonlib.checkMock()
 
-        retry(3) {
-            buildlib.registry_quay_dev_login()
-        }
-
         stage("Initialize") {
             currentBuild.displayName = "#${currentBuild.number}"
 
@@ -97,97 +76,83 @@ timeout(activity: true, time: 120, unit: 'MINUTES') {
             currentBuild.description = "Assembly: ${params.ASSEMBLY}"
         }
 
-        stage("Sync CI Images") {
-            sshagent(["openshift-bot"]) {
-                buildlib.init_artcd_working_dir()
-                def cmd = [
-                    "artcd",
-                    "-v",
-                    "--working-dir=./artcd_working",
-                    "--config=./config/artcd.toml",
-                ]
-                if (params.DRY_RUN) {
-                    cmd << "--dry-run"
-                }
-                cmd += [
-                    "sync-ci-images",
-                    "--for-release=${params.VERSION}",
-                    "--assembly=${params.ASSEMBLY}",
-                ]
-                if (params.DATA_PATH) {
-                    cmd << "--data-path=${params.DATA_PATH}"
-                }
-                if (params.DATA_GITREF) {
-                    cmd << "--data-gitref=${params.DATA_GITREF}"
-                }
-                if (params.ONLY_STREAM) {
-                    cmd << "--only-stream=${params.ONLY_STREAM}"
-                }
-                if (params.IMAGES) {
-                    cmd << "--images=${params.IMAGES}"
-                }
-                if (params.SKIP_WAITS) {
-                    cmd << "--skip-waits"
-                }
-                if (params.FORCE_RUN) {
-                    cmd << "--force-run"
-                }
-                if (params.UPDATE_IMAGES_ONLY_WHEN_MISSING) {
-                    cmd << "--update-images-only-when-missing"
-                }
+        stage("Sync CI BuildConfigs") {
+            buildlib.init_artcd_working_dir()
+            def cmd = [
+                "artcd",
+                "-v",
+                "--working-dir=./artcd_working",
+                "--config=./config/artcd.toml",
+            ]
+            if (params.DRY_RUN) {
+                cmd << "--dry-run"
+            }
+            cmd += [
+                "sync-ci-buildconfigs",
+                "--for-release=${params.VERSION}",
+                "--assembly=${params.ASSEMBLY}",
+            ]
+            if (params.DATA_PATH) {
+                cmd << "--data-path=${params.DATA_PATH}"
+            }
+            if (params.DATA_GITREF) {
+                cmd << "--data-gitref=${params.DATA_GITREF}"
+            }
+            if (params.ONLY_STREAM) {
+                cmd << "--only-stream=${params.ONLY_STREAM}"
+            }
+            if (params.IMAGES) {
+                cmd << "--images=${params.IMAGES}"
+            }
 
-                // Run pipeline
-                buildlib.withAppCiAsArtPublish() {
-                    withCredentials([
-                            string(credentialsId: 'jenkins-service-account', variable: 'JENKINS_SERVICE_ACCOUNT'),
-                            string(credentialsId: 'jenkins-service-account-token', variable: 'JENKINS_SERVICE_ACCOUNT_TOKEN'),
-                            string(credentialsId: 'redis-server-password', variable: 'REDIS_SERVER_PASSWORD'),
-                            string(credentialsId: 'openshift-bot-token', variable: 'GITHUB_TOKEN'),
-                            string(credentialsId: 'openshift-art-build-bot-app-id', variable: 'GITHUB_APP_ID'),
-                            file(credentialsId: 'openshift-art-build-bot-private-key.pem', variable: 'GITHUB_APP_PRIVATE_KEY_PATH'),
-                            string(credentialsId: 'art-bot-slack-token', variable: 'SLACK_BOT_TOKEN'),
-                            file(credentialsId: 'quay-auth-file', variable: 'QUAY_AUTH_FILE'),
-                            file(credentialsId: 'konflux-gcp-app-creds-prod', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
-                            string(credentialsId: 'jboss-jira-token', variable: 'JIRA_TOKEN'),
-                            usernamePassword(credentialsId: 'art_to_ci_promotion_robot--qci', usernameVariable: 'QCI_USER', passwordVariable: 'QCI_PASSWORD'),
-                        ]) {
-                        wrap([$class: 'BuildUser']) {
-                            builderEmail = env.BUILD_USER_EMAIL
-                        }
+            // Checkout optional art-tools commit override
+            buildlib.initialize()
 
-                        withEnv(["BUILD_USER_EMAIL=${builderEmail?: ''}", "BUILD_URL=${BUILD_URL}", "JOB_NAME=${JOB_NAME}"]) {
-                            try {
-                                echo "Will run ${cmd.join(' ')}"
+            // Run pipeline with the app.ci identity used by QCI-APPCI
+            buildlib.withAppCiAsArtPublish() {
+                withCredentials([
+                        string(credentialsId: 'jenkins-service-account', variable: 'JENKINS_SERVICE_ACCOUNT'),
+                        string(credentialsId: 'jenkins-service-account-token', variable: 'JENKINS_SERVICE_ACCOUNT_TOKEN'),
+                        string(credentialsId: 'redis-server-password', variable: 'REDIS_SERVER_PASSWORD'),
+                        string(credentialsId: 'openshift-art-build-bot-app-id', variable: 'GITHUB_APP_ID'),
+                        file(credentialsId: 'openshift-art-build-bot-private-key.pem', variable: 'GITHUB_APP_PRIVATE_KEY_PATH'),
+                        file(credentialsId: 'quay-auth-file', variable: 'QUAY_AUTH_FILE'),
+                        file(credentialsId: 'konflux-gcp-app-creds-prod', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                        usernamePassword(credentialsId: 'art_to_ci_promotion_robot--qci', usernameVariable: 'QCI_USER', passwordVariable: 'QCI_PASSWORD'),
+                ]) {
+                    wrap([$class: 'BuildUser']) {
+                        builderEmail = env.BUILD_USER_EMAIL
+                    }
 
-                                timeout(activity: true, time: 120, unit: 'MINUTES') {
-                                    def rc = sh(script: cmd.join(' '), returnStatus: true)
-                                    if (rc == 25) {
-                                        currentBuild.result = 'UNSTABLE'
-                                        echo "sync-ci-images completed with partial errors (rc=25)"
-                                    } else if (rc != 0) {
-                                        error("sync-ci-images failed with exit code ${rc}")
-                                    }
+                    withEnv(["BUILD_USER_EMAIL=${builderEmail?: ''}", "BUILD_URL=${BUILD_URL}", "JOB_NAME=${JOB_NAME}"]) {
+                        try {
+                            echo "Will run ${cmd.join(' ')}"
+
+                            timeout(activity: true, time: 120, unit: 'MINUTES') {
+                                def rc = sh(script: cmd.join(' '), returnStatus: true)
+                                if (rc != 0) {
+                                    error("sync-ci-buildconfigs failed with exit code ${rc}")
                                 }
-
-                            } catch (err) {
-                                echo "Error running ${params.VERSION} sync-ci-images:\n${err}"
-                                throw err
-
-                            } finally {
-                                // Archive logs if they exist
-                                def debugLog = "${doozer_working}/debug.log"
-                                if (fileExists(debugLog)) {
-                                    sh "mv ${debugLog} ${doozer_working}/debug-${params.VERSION}.log"
-                                    sh "bzip2 ${doozer_working}/debug-${params.VERSION}.log"
-                                    commonlib.safeArchiveArtifacts(["artcd_working/doozer_working/*.bz2"])
-                                }
-                                buildlib.cleanWorkspace()
                             }
-                        } // withEnv
-                    } // withCredentials
-                } // withAppCiAsArtPublish
-            } // sshagent
+
+                        } catch (err) {
+                            echo "Error running ${params.VERSION} sync-ci-buildconfigs:\n${err}"
+                            throw err
+
+                        } finally {
+                            // Archive logs if they exist
+                            def debugLog = "${doozer_working}/debug.log"
+                            if (fileExists(debugLog)) {
+                                sh "mv ${debugLog} ${doozer_working}/debug-${params.VERSION}.log"
+                                sh "bzip2 ${doozer_working}/debug-${params.VERSION}.log"
+                                commonlib.safeArchiveArtifacts(["artcd_working/doozer_working/*.bz2"])
+                            }
+                            buildlib.cleanWorkspace()
+                        }
+                    } // withEnv
+                } // withCredentials
+            } // withAppCiAsArtPublish
         } // stage
-    }
         }
+    }
 }
